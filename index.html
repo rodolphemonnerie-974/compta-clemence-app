@@ -392,6 +392,11 @@
   </div>
   <button class="btn" onclick="tryLogin()" style="width:100%;">Entrer</button>
   <p id="login-error" class="neg" style="font-size:12px;"></p>
+  <p id="login-sync-msg" class="muted" style="font-size:12px;"></p>
+  <p style="font-size:12px; margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">
+    Première connexion sur cet appareil ?
+    <a href="#" onclick="openSyncToken(); return false;" style="color:var(--primary); font-weight:600;">Connecter la synchronisation</a>
+  </p>
 </div>
 
 <div id="app" style="display:none;">
@@ -405,7 +410,7 @@
         Exercice
         <select id="exercice-select" onchange="setExerciceAffiche(this.value)"></select>
       </div>
-      <button class="btn ghost" id="cloud-badge" style="background:#fff;" title="Synchroniser avec le stockage en ligne" onclick="cloudSyncNow()">☁ Sync</button>
+      <button class="btn ghost" id="cloud-badge" style="background:#fff;" title="Synchroniser avec le stockage en ligne" onclick="cloudButtonClick()">☁ Sync</button>
       <button class="btn ghost theme-toggle" id="theme-btn" title="Basculer clair / sombre" onclick="toggleTheme()">🌙</button>
       <button class="btn ghost" style="background:#fff;" onclick="exportJSON()">⬇ Exporter (sauvegarde)</button>
       <button class="btn ghost" style="background:#fff;" onclick="document.getElementById('import-file').click()" title="Importer une sauvegarde JSON ou des opérations depuis un fichier Excel/CSV">⬆ Importer</button>
@@ -4425,11 +4430,27 @@ function saveLocalOnly() {
 
 // ============ SYNCHRONISATION EN LIGNE (GitHub) + SAUVEGARDE (Google Drive) ============
 const CLOUD_KEY = "clemence_cloud_cfg";
+// Paramètres de connexion pré-remplis (non secrets) : ainsi un nouvel utilisateur n'a
+// RIEN à configurer, il lui suffit de coller le jeton une fois sur son poste.
+const CLOUD_DEFAULTS = {
+  owner: "rodolphemonnerie-974",
+  repo: "compta-clemence",
+  branch: "main",
+  path: "donnees.json",
+  driveUrl: "https://script.google.com/macros/s/AKfycbwCnVztUPgz63DKHB9i85vWE9jlsanWR_RWJ2NYyC1_HsqTXvl22WdZ_9aImVgCS6Cnyg/exec",
+  autosync: true,
+};
 let cloudSha = null;      // dernier sha connu du fichier distant (GitHub)
 let cloudPushTimer = null;
 let cloudBusy = false;
 
-function cloudCfg() { try { return JSON.parse(localStorage.getItem(CLOUD_KEY) || "{}"); } catch (e) { return {}; } }
+// Configuration effective = valeurs par défaut + ce qui est enregistré localement (dont le jeton).
+function cloudCfg() {
+  let stored = {};
+  try { stored = JSON.parse(localStorage.getItem(CLOUD_KEY) || "{}"); } catch (e) {}
+  return Object.assign({}, CLOUD_DEFAULTS, stored);
+}
+function cloudStored() { try { return JSON.parse(localStorage.getItem(CLOUD_KEY) || "{}"); } catch (e) { return {}; } }
 function setCloudCfg(c) { localStorage.setItem(CLOUD_KEY, JSON.stringify(c)); }
 function cloudConfigured() { const c = cloudCfg(); return !!(c.owner && c.repo && c.token); }
 
@@ -4528,10 +4549,57 @@ async function driveBackup(silent) {
 
 // Sync manuelle complète depuis l'en-tête (Récupérer puis Envoyer).
 async function cloudSyncNow() {
-  if (!cloudConfigured()) { toast("Configuration de synchronisation absente (Réglages)."); return; }
+  if (!cloudConfigured()) { openSyncToken(); return; }
   const okPull = await cloudPull(true);
   if (okPull) await cloudPush(true);
   toast("Synchronisation effectuée.");
+}
+
+// Bouton ☁ de l'en-tête : si pas encore de jeton sur ce poste, demander le jeton ; sinon synchroniser.
+function cloudButtonClick() {
+  if (!cloudCfg().token) openSyncToken();
+  else cloudSyncNow();
+}
+
+// Saisie du jeton en un seul champ — accessible à TOUS les rôles, une seule fois par poste.
+function openSyncToken() {
+  const c = cloudCfg();
+  showModal(`
+    <h3>Connexion à la synchronisation</h3>
+    <p class="muted" style="font-size:13px;">Cet appareil se connecte au dossier partagé <strong>${escapeHtml(c.owner)}/${escapeHtml(c.repo)}</strong>. Collez le <strong>jeton d'accès fourni par le trésorier</strong> : il n'est demandé qu'<strong>une seule fois sur ce poste</strong>. Ensuite, votre identifiant et votre mot de passe suffisent.</p>
+    <div class="form-row"><label>Jeton de synchronisation</label>
+      <div class="pw-wrap">
+        <input type="password" id="sync-token" value="${escapeHtml(c.token || "")}" placeholder="github_pat_… ou gho_…" autocomplete="off">
+        <span class="pw-eye" title="Gardez le curseur ici pour afficher"
+          onmouseenter="pwShow('sync-token', true)" onmouseleave="pwShow('sync-token', false)"
+          onmousedown="pwShow('sync-token', true)" onmouseup="pwShow('sync-token', false)">👁</span>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeModal()">Plus tard</button>
+      <button class="btn accent" onclick="saveSyncToken()">Connecter et récupérer</button>
+    </div>
+  `);
+  setTimeout(() => { const el = document.getElementById("sync-token"); if (el) el.focus(); }, 0);
+}
+async function saveSyncToken() {
+  const t = (document.getElementById("sync-token").value || "").trim();
+  if (!t) { toast("Collez le jeton fourni par le trésorier."); return; }
+  const stored = cloudStored();
+  stored.token = t;
+  stored.autosync = true;
+  setCloudCfg(stored);
+  cloudSha = null;
+  closeModal();
+  const ok = await cloudPull(false); // récupère aussitôt les données partagées
+  const msg = document.getElementById("login-sync-msg");
+  const onLogin = document.getElementById("login-screen") && document.getElementById("login-screen").style.display !== "none";
+  if (ok) {
+    toast("Données synchronisées.");
+    if (onLogin && msg) msg.innerHTML = `<span class="pos">✓ Synchronisé — connectez-vous avec votre identifiant et mot de passe.</span>`;
+  } else if (onLogin && msg) {
+    msg.innerHTML = `<span class="neg">Échec de la synchronisation — vérifiez le jeton.</span>`;
+  }
 }
 function saveCloudConfig() {
   if (!requireAdmin()) return;
@@ -5110,8 +5178,11 @@ function init() {
   renderBackupBanner();
   render();
   maybeDailyBackup();
-  // Récupération automatique des données partagées à la connexion (si activée).
-  if (cloudCfg().autosync && cloudConfigured()) cloudPull(true);
+  // Synchronisation à la connexion :
+  //  - si le jeton est déjà présent sur ce poste → récupération automatique et silencieuse ;
+  //  - sinon, si la connexion est pré-configurée (owner/repo) → on invite à coller le jeton (une seule fois).
+  if (cloudConfigured()) { if (cloudCfg().autosync) cloudPull(true); }
+  else if (cloudCfg().owner && cloudCfg().repo) { setTimeout(openSyncToken, 300); }
 }
 
 function populateExerciceSelect() {
