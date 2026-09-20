@@ -393,9 +393,8 @@
   <button class="btn" onclick="tryLogin()" style="width:100%;">Entrer</button>
   <p id="login-error" class="neg" style="font-size:12px;"></p>
   <p id="login-sync-msg" class="muted" style="font-size:12px;"></p>
-  <p style="font-size:12px; margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">
-    Première connexion sur cet appareil ?
-    <a href="#" onclick="openSyncToken(); return false;" style="color:var(--primary); font-weight:600;">Connecter la synchronisation</a>
+  <p class="muted" style="font-size:11px; margin-top:14px; border-top:1px solid var(--border); padding-top:12px;">
+    Vos données sont chargées automatiquement après connexion, depuis n'importe quel ordinateur.
   </p>
 </div>
 
@@ -4428,194 +4427,99 @@ function saveLocalOnly() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(DB));
 }
 
-// ============ SYNCHRONISATION EN LIGNE (GitHub) + SAUVEGARDE (Google Drive) ============
-const CLOUD_KEY = "clemence_cloud_cfg";
-// Paramètres de connexion pré-remplis (non secrets) : ainsi un nouvel utilisateur n'a
-// RIEN à configurer, il lui suffit de coller le jeton une fois sur son poste.
-const CLOUD_DEFAULTS = {
-  owner: "rodolphemonnerie-974",
-  repo: "compta-clemence",
-  branch: "main",
-  path: "donnees.json",
-  driveUrl: "https://script.google.com/macros/s/AKfycbwCnVztUPgz63DKHB9i85vWE9jlsanWR_RWJ2NYyC1_HsqTXvl22WdZ_9aImVgCS6Cnyg/exec",
-  autosync: true,
-};
-let cloudSha = null;      // dernier sha connu du fichier distant (GitHub)
-let cloudPushTimer = null;
-let cloudBusy = false;
+// ============ PASSERELLE D'ACCÈS ET DE SAUVEGARDE (Google Apps Script) ============
+// L'application ne détient AUCUN secret. La passerelle vérifie l'identifiant et le mot
+// de passe côté serveur, détient seule le jeton GitHub, lit/écrit le fichier de données
+// et dépose une sauvegarde Drive à chaque connexion et à chaque enregistrement.
+// => Depuis n'importe quel ordinateur : ouvrir l'adresse, saisir identifiant + mot de passe.
+const GATEWAY_URL = "https://script.google.com/macros/s/AKfycbydH-q-2SHtOGYT6gWARqJkyTBRNrDWkziUmK-rl3RkS1N36VSV98yBntc5Ex2gCELW/exec";
+const GW_SESSION_KEY = "clemence_session_gw";
+let gwPushTimer = null;
+let gwBusy = false;
+let gwOffline = false;   // vrai si la passerelle est injoignable (mode local de secours)
 
-// Configuration effective = valeurs par défaut + ce qui est enregistré localement (dont le jeton).
-function cloudCfg() {
-  let stored = {};
-  try { stored = JSON.parse(localStorage.getItem(CLOUD_KEY) || "{}"); } catch (e) {}
-  return Object.assign({}, CLOUD_DEFAULTS, stored);
-}
-function cloudStored() { try { return JSON.parse(localStorage.getItem(CLOUD_KEY) || "{}"); } catch (e) { return {}; } }
-function setCloudCfg(c) { localStorage.setItem(CLOUD_KEY, JSON.stringify(c)); }
-function cloudConfigured() { const c = cloudCfg(); return !!(c.owner && c.repo && c.token); }
-
-function b64EncodeUnicode(str) { return btoa(unescape(encodeURIComponent(str))); }
-function b64DecodeUnicode(str) { return decodeURIComponent(escape(atob(str))); }
+function gatewayConfigured() { return /^https:\/\/script\.google\.com\/.+\/exec$/.test(GATEWAY_URL); }
+function gwSession() { try { return sessionStorage.getItem(GW_SESSION_KEY) || ""; } catch (e) { return ""; } }
+function setGwSession(s) { try { if (s) sessionStorage.setItem(GW_SESSION_KEY, s); else sessionStorage.removeItem(GW_SESSION_KEY); } catch (e) {} }
 
 function cloudStatus(msg, kind) {
-  const els = [document.getElementById("cloud-status")];
-  els.forEach(el => { if (el) { el.textContent = msg; el.className = kind === "err" ? "neg" : (kind === "ok" ? "pos" : "muted"); el.style.fontSize = "12px"; } });
+  const el = document.getElementById("cloud-status");
+  if (el) { el.textContent = msg; el.className = kind === "err" ? "neg" : (kind === "ok" ? "pos" : "muted"); el.style.fontSize = "12px"; }
   const badge = document.getElementById("cloud-badge");
   if (badge) badge.title = msg;
 }
 
-async function githubContents(method, cfg, body) {
-  const base = `https://api.github.com/repos/${cfg.owner}/${cfg.repo}/contents/${(cfg.path || "donnees.json").split("/").map(encodeURIComponent).join("/")}`;
-  const url = method === "GET" ? `${base}?ref=${encodeURIComponent(cfg.branch || "main")}` : base;
-  return fetch(url, {
-    method,
-    headers: { "Authorization": "Bearer " + cfg.token, "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28" },
-    body: body ? JSON.stringify(body) : undefined,
+async function gatewayCall(payload) {
+  // "text/plain" évite une requête préalable CORS ; la passerelle répond en JSON.
+  const r = await fetch(GATEWAY_URL, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify(payload),
+    redirect: "follow",
   });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return await r.json();
 }
 
+// Récupère les données partagées.
 async function cloudPull(silent) {
-  const cfg = cloudCfg();
-  if (!cloudConfigured()) { if (!silent) cloudStatus("Configuration GitHub incomplète.", "err"); return false; }
-  if (cloudBusy) return false;
-  cloudBusy = true; cloudStatus("Récupération des données en ligne…");
+  if (!gatewayConfigured()) { if (!silent) cloudStatus("Passerelle non configurée.", "err"); return false; }
+  if (!gwSession()) { if (!silent) cloudStatus("Reconnectez-vous pour synchroniser.", "err"); return false; }
+  if (gwBusy) return false;
+  gwBusy = true; if (!silent) cloudStatus("Récupération des données…");
   try {
-    const r = await githubContents("GET", cfg);
-    if (r.status === 404) { cloudStatus("Aucune donnée en ligne pour l'instant. Utilisez « Envoyer » pour initialiser.", "err"); cloudBusy = false; return false; }
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    const j = await r.json();
-    cloudSha = j.sha;
-    const data = JSON.parse(b64DecodeUnicode((j.content || "").replace(/\n/g, "")));
-    if (!data.config || !data.membres || !data.journal) throw new Error("Fichier distant invalide");
-    // Fusion prudente : on conserve les utilisateurs locaux si le fichier distant n'en a pas.
-    DB = migrateDB(data);
+    const res = await gatewayCall({ action: "pull", session: gwSession() });
+    if (!res.ok) {
+      if (res.expired) { setGwSession(""); cloudStatus("Session expirée — reconnectez-vous.", "err"); }
+      else cloudStatus("Échec : " + res.error, "err");
+      gwBusy = false; return false;
+    }
+    DB = migrateDB(res.data);
     saveLocalOnly();
-    if (typeof render === "function" && document.getElementById("app") && document.getElementById("app").style.display !== "none") render();
-    cloudStatus("✓ Données récupérées depuis GitHub (" + new Date().toLocaleString("fr-FR") + ").", "ok");
-    cloudBusy = false; return true;
-  } catch (e) { cloudStatus("Échec de la récupération : " + e.message, "err"); cloudBusy = false; return false; }
+    gwOffline = false;
+    if (document.getElementById("app") && document.getElementById("app").style.display !== "none") render();
+    cloudStatus("✓ Données à jour (" + new Date().toLocaleTimeString("fr-FR") + ").", "ok");
+    gwBusy = false; return true;
+  } catch (e) { gwOffline = true; cloudStatus("Hors ligne : " + e.message, "err"); gwBusy = false; return false; }
 }
 
+// Envoie les données : la passerelle versionne sur GitHub et sauvegarde sur Drive.
 async function cloudPush(silent) {
-  const cfg = cloudCfg();
-  if (!cloudConfigured()) { if (!silent) cloudStatus("Configuration GitHub incomplète.", "err"); return false; }
-  if (cloudBusy) return false;
-  cloudBusy = true; if (!silent) cloudStatus("Envoi des données en ligne…");
+  if (!gatewayConfigured() || !gwSession()) return false;
+  if (gwBusy) { scheduleCloudPush(); return false; }
+  gwBusy = true; if (!silent) cloudStatus("Enregistrement en ligne…");
   try {
-    // Récupère le sha courant si on ne l'a pas (fichier déjà existant).
-    if (!cloudSha) {
-      const g = await githubContents("GET", cfg);
-      if (g.ok) { const gj = await g.json(); cloudSha = gj.sha; }
+    const res = await gatewayCall({ action: "save", session: gwSession(), data: DB });
+    if (!res.ok) {
+      if (res.expired) { setGwSession(""); cloudStatus("Session expirée — reconnectez-vous.", "err"); }
+      else cloudStatus("Échec de l'enregistrement : " + res.error, "err");
+      gwBusy = false; return false;
     }
-    const content = b64EncodeUnicode(JSON.stringify(DB, null, 2));
-    const body = { message: "Trésorerie Clémence — " + new Date().toISOString(), content, branch: cfg.branch || "main" };
-    if (cloudSha) body.sha = cloudSha;
-    const r = await githubContents("PUT", cfg, body);
-    if (r.status === 409 || r.status === 422) {
-      cloudSha = null;
-      cloudStatus("⚠ Conflit : les données en ligne ont changé. Cliquez « Récupérer » avant d'envoyer.", "err");
-      cloudBusy = false; return false;
-    }
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    const j = await r.json();
-    cloudSha = j.content ? j.content.sha : cloudSha;
-    if (!silent) cloudStatus("✓ Données envoyées sur GitHub (" + new Date().toLocaleString("fr-FR") + ").", "ok");
-    else cloudStatus("✓ Synchronisé (" + new Date().toLocaleTimeString("fr-FR") + ").", "ok");
-    cloudBusy = false; return true;
-  } catch (e) { cloudStatus("Échec de l'envoi : " + e.message, "err"); cloudBusy = false; return false; }
+    gwOffline = false;
+    cloudStatus("✓ Enregistré et sauvegardé (" + new Date().toLocaleTimeString("fr-FR") + ").", "ok");
+    gwBusy = false; return true;
+  } catch (e) { gwOffline = true; cloudStatus("Hors ligne — modifications conservées sur ce poste.", "err"); gwBusy = false; return false; }
 }
 
 function scheduleCloudPush() {
-  const cfg = cloudCfg();
-  if (!cfg.autosync || !cloudConfigured()) return;
-  clearTimeout(cloudPushTimer);
-  cloudPushTimer = setTimeout(() => { cloudPush(true); }, 2500);
+  if (!gatewayConfigured() || !gwSession() || !canEdit()) return;
+  clearTimeout(gwPushTimer);
+  gwPushTimer = setTimeout(() => { cloudPush(true); }, 2000);
 }
 
-// Sauvegarde vers Google Drive via un Web App Google Apps Script (sans OAuth côté navigateur).
-async function driveBackup(silent) {
-  const cfg = cloudCfg();
-  if (!cfg.driveUrl) { if (!silent) cloudStatus("URL Google Drive non configurée.", "err"); return false; }
-  try {
-    await fetch(cfg.driveUrl, {
-      method: "POST", mode: "no-cors",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({ name: "tresorerie-clemence-" + todayStr() + ".json", data: JSON.stringify(DB) }),
-    });
-    if (!silent) cloudStatus("✓ Sauvegarde envoyée à Google Drive (fire-and-forget).", "ok");
-    return true;
-  } catch (e) { if (!silent) cloudStatus("Échec Google Drive : " + e.message, "err"); return false; }
-}
-
-// Sync manuelle complète depuis l'en-tête (Récupérer puis Envoyer).
 async function cloudSyncNow() {
-  if (!cloudConfigured()) { openSyncToken(); return; }
-  const okPull = await cloudPull(true);
-  if (okPull) await cloudPush(true);
-  toast("Synchronisation effectuée.");
+  if (!gwSession()) { toast("Connectez-vous pour synchroniser."); return; }
+  const ok = await cloudPull(true);
+  if (ok && canEdit()) await cloudPush(true);
+  toast(ok ? "Synchronisation effectuée." : "Synchronisation impossible (hors ligne ?).");
 }
+function cloudButtonClick() { cloudSyncNow(); }
 
-// Bouton ☁ de l'en-tête : si pas encore de jeton sur ce poste, demander le jeton ; sinon synchroniser.
-function cloudButtonClick() {
-  if (!cloudCfg().token) openSyncToken();
-  else cloudSyncNow();
-}
-
-// Saisie du jeton en un seul champ — accessible à TOUS les rôles, une seule fois par poste.
-function openSyncToken() {
-  const c = cloudCfg();
-  showModal(`
-    <h3>Connexion à la synchronisation</h3>
-    <p class="muted" style="font-size:13px;">Cet appareil se connecte au dossier partagé <strong>${escapeHtml(c.owner)}/${escapeHtml(c.repo)}</strong>. Collez le <strong>jeton d'accès fourni par le trésorier</strong> : il n'est demandé qu'<strong>une seule fois sur ce poste</strong>. Ensuite, votre identifiant et votre mot de passe suffisent.</p>
-    <div class="form-row"><label>Jeton de synchronisation</label>
-      <div class="pw-wrap">
-        <input type="password" id="sync-token" value="${escapeHtml(c.token || "")}" placeholder="github_pat_… ou gho_…" autocomplete="off">
-        <span class="pw-eye" title="Gardez le curseur ici pour afficher"
-          onmouseenter="pwShow('sync-token', true)" onmouseleave="pwShow('sync-token', false)"
-          onmousedown="pwShow('sync-token', true)" onmouseup="pwShow('sync-token', false)">👁</span>
-      </div>
-    </div>
-    <div class="modal-actions">
-      <button class="btn ghost" onclick="closeModal()">Plus tard</button>
-      <button class="btn accent" onclick="saveSyncToken()">Connecter et récupérer</button>
-    </div>
-  `);
-  setTimeout(() => { const el = document.getElementById("sync-token"); if (el) el.focus(); }, 0);
-}
-async function saveSyncToken() {
-  const t = (document.getElementById("sync-token").value || "").trim();
-  if (!t) { toast("Collez le jeton fourni par le trésorier."); return; }
-  const stored = cloudStored();
-  stored.token = t;
-  stored.autosync = true;
-  setCloudCfg(stored);
-  cloudSha = null;
-  closeModal();
-  const ok = await cloudPull(false); // récupère aussitôt les données partagées
-  const msg = document.getElementById("login-sync-msg");
-  const onLogin = document.getElementById("login-screen") && document.getElementById("login-screen").style.display !== "none";
-  if (ok) {
-    toast("Données synchronisées.");
-    if (onLogin && msg) msg.innerHTML = `<span class="pos">✓ Synchronisé — connectez-vous avec votre identifiant et mot de passe.</span>`;
-  } else if (onLogin && msg) {
-    msg.innerHTML = `<span class="neg">Échec de la synchronisation — vérifiez le jeton.</span>`;
-  }
-}
-function saveCloudConfig() {
-  if (!requireAdmin()) return;
-  const cfg = {
-    owner: document.getElementById("cl-owner").value.trim(),
-    repo: document.getElementById("cl-repo").value.trim(),
-    branch: document.getElementById("cl-branch").value.trim() || "main",
-    path: document.getElementById("cl-path").value.trim() || "donnees.json",
-    token: document.getElementById("cl-token").value.trim(),
-    autosync: document.getElementById("cl-autosync").checked,
-    driveUrl: document.getElementById("cl-drive").value.trim(),
-  };
-  setCloudCfg(cfg);
-  cloudSha = null;
-  cloudStatus("Configuration enregistrée.", "ok");
-  render();
+// Les sauvegardes Google Drive sont désormais faites par la passerelle,
+// à chaque connexion et à chaque enregistrement. Conservé pour compatibilité.
+async function driveBackup(silent) {
+  if (!silent) cloudStatus("Les sauvegardes Drive sont automatiques (à chaque connexion et à chaque enregistrement).", "ok");
+  return true;
 }
 
 // ============ THÈME CLAIR / SOMBRE ============
@@ -4721,20 +4625,58 @@ function pwShow(inputId, show) {
   if (el) el.type = show ? "text" : "password";
 }
 
-function tryLogin() {
+function openApp() {
+  try { sessionStorage.setItem(SESSION_KEY, JSON.stringify(currentUser)); } catch (e) {}
+  document.getElementById("login-screen").style.display = "none";
+  document.getElementById("app").style.display = "block";
+  applyRole();
+  init();
+}
+
+// Connexion : la passerelle vérifie le mot de passe côté serveur et renvoie les données.
+// Aucun réglage ni jeton à saisir : identifiant + mot de passe suffisent, sur n'importe quel poste.
+async function tryLogin() {
   if (!DB) DB = loadDB();
   const login = (document.getElementById("login-user").value || "").trim();
   const pw = document.getElementById("login-pass").value || "";
+  const err = document.getElementById("login-error");
+  const msg = document.getElementById("login-sync-msg");
+  err.textContent = "";
+  if (msg) msg.textContent = "";
+  if (!login || !pw) { err.textContent = "Saisissez votre identifiant et votre mot de passe."; return; }
+
+  if (gatewayConfigured()) {
+    if (msg) msg.textContent = "Connexion en cours…";
+    try {
+      const res = await gatewayCall({ action: "login", login, password: pw });
+      if (res.ok) {
+        setGwSession(res.session);
+        DB = migrateDB(res.data);
+        saveLocalOnly();
+        currentUser = { login: res.user.login, nom: res.user.nom || "", role: res.user.role };
+        gwOffline = false;
+        if (msg) msg.textContent = "";
+        openApp();
+        return;
+      }
+      err.textContent = res.error || "Identifiant ou mot de passe incorrect.";
+      if (msg) msg.textContent = "";
+      return;
+    } catch (e) {
+      // Serveur injoignable : on bascule sur la vérification locale (mode dégradé).
+      gwOffline = true;
+      if (msg) msg.innerHTML = `<span class="neg">Serveur injoignable — tentative en mode local.</span>`;
+    }
+  }
+
+  // Repli local : vérification sur la copie conservée par ce poste.
   const u = (DB.users || []).find(x => String(x.login).toLowerCase() === login.toLowerCase() && x.actif !== false);
   if (u && u.hash === hashPw(login, pw)) {
     currentUser = { login: u.login, nom: u.nom || "", role: u.role };
-    try { sessionStorage.setItem(SESSION_KEY, JSON.stringify(currentUser)); } catch (e) {}
-    document.getElementById("login-screen").style.display = "none";
-    document.getElementById("app").style.display = "block";
-    applyRole();
-    init();
+    openApp();
+    if (gwOffline) toast("Mode hors ligne : pensez à synchroniser dès le retour du réseau.");
   } else {
-    document.getElementById("login-error").textContent = "Identifiant ou mot de passe incorrect.";
+    err.textContent = "Identifiant ou mot de passe incorrect.";
   }
 }
 
@@ -4789,7 +4731,7 @@ async function createBackupSnapshot(manual) {
     const all = (await idbAll()).sort((a, b) => a.day.localeCompare(b.day));
     while (all.length > BACKUP_KEEP) { const old = all.shift(); await idbDelete(old.day); }
     localStorage.setItem(BACKUP_LAST_KEY, day);
-    if (cloudCfg().driveUrl) driveBackup(true); // archivage Google Drive si configuré
+    // L'archivage Google Drive est assuré par la passerelle (connexion + enregistrement).
     if (manual) { toast("Sauvegarde du jour enregistrée."); if (currentTab === "parametres") render(); }
   } catch (e) { console.error("Sauvegarde automatique impossible", e); if (manual) toast("Sauvegarde impossible sur ce navigateur."); }
 }
@@ -4943,12 +4885,13 @@ function toast(msg) {
   if (el) el.addEventListener("keydown", (e) => { if (e.key === "Enter") tryLogin(); });
 });
 DB = loadDB();
-saveDB(); // persiste immédiatement les migrations (correction montants 2026, seed admin, etc.)
+saveLocalOnly(); // persiste les migrations sans déclencher d'envoi en ligne
 applyTheme();
-// Reconnexion automatique depuis la session en cours (sessionStorage).
+// Reconnexion automatique pendant la session du navigateur (onglet rouvert, page rechargée).
+// Si la passerelle est configurée, on exige aussi une session serveur encore valide.
 try {
   const s = sessionStorage.getItem(SESSION_KEY);
-  if (s) {
+  if (s && (!gatewayConfigured() || gwSession())) {
     const u = JSON.parse(s);
     const real = (DB.users || []).find(x => String(x.login) === String(u.login) && x.actif !== false);
     if (real) {
@@ -4957,6 +4900,7 @@ try {
       document.getElementById("app").style.display = "block";
       applyRole();
       init();
+      if (gwSession()) cloudPull(true); // rafraîchit les données partagées
     }
   }
 } catch (e) {}
@@ -5181,8 +5125,8 @@ function init() {
   // Synchronisation à la connexion :
   //  - si le jeton est déjà présent sur ce poste → récupération automatique et silencieuse ;
   //  - sinon, si la connexion est pré-configurée (owner/repo) → on invite à coller le jeton (une seule fois).
-  if (cloudConfigured()) { if (cloudCfg().autosync) cloudPull(true); }
-  else if (cloudCfg().owner && cloudCfg().repo) { setTimeout(openSyncToken, 300); }
+  // Les données ont déjà été chargées par la passerelle au moment de la connexion.
+  if (gwOffline) cloudStatus("Mode hors ligne : les modifications ne sont pas encore synchronisées.", "err");
 }
 
 function populateExerciceSelect() {
@@ -7234,39 +7178,28 @@ function printFinances() {
 
 // ============ PARAMÈTRES ============
 function renderCloudCard() {
-  const c = cloudCfg();
+  const ok = gatewayConfigured();
+  const etat = !ok ? "Passerelle non configurée dans l'application."
+    : (gwOffline ? "Hors ligne : les modifications sont conservées sur ce poste et seront envoyées au retour du réseau."
+      : (gwSession() ? "Connecté à la passerelle — synchronisation automatique active." : "Session absente : reconnectez-vous."));
   return `
   <div class="card" style="margin-top:14px;">
-    <h2>Synchronisation en ligne & sauvegarde (GitHub + Google Drive)</h2>
-    <p class="muted" style="font-size:12px;">Stocke les données dans un dépôt GitHub privé partagé : tous les postes voient les mêmes informations, et chaque enregistrement crée une version conservée (historique). Google Drive sert d'archivage automatique supplémentaire. Voir le guide de mise en œuvre fourni.</p>
-    <h3 style="font-size:14px; margin:12px 0 6px;">Dépôt GitHub (base partagée)</h3>
-    <div class="form-grid">
-      <div class="form-row"><label>Propriétaire (owner)</label><input id="cl-owner" value="${escapeHtml(c.owner || "")}" placeholder="ex. monnerie-rodolphe"></div>
-      <div class="form-row"><label>Dépôt (repository)</label><input id="cl-repo" value="${escapeHtml(c.repo || "")}" placeholder="ex. compta-clemence"></div>
-      <div class="form-row"><label>Branche</label><input id="cl-branch" value="${escapeHtml(c.branch || "main")}"></div>
-      <div class="form-row"><label>Fichier de données</label><input id="cl-path" value="${escapeHtml(c.path || "donnees.json")}"></div>
-      <div class="form-row" style="grid-column: span 2;"><label>Jeton d'accès (token GitHub, fine-grained, droit Contents lecture/écriture)</label>
-        <div class="pw-wrap">
-          <input type="password" id="cl-token" value="${escapeHtml(c.token || "")}" placeholder="github_pat_…" autocomplete="off">
-          <span class="pw-eye" title="Gardez le curseur ici pour afficher"
-            onmouseenter="pwShow('cl-token', true)" onmouseleave="pwShow('cl-token', false)"
-            onmousedown="pwShow('cl-token', true)" onmouseup="pwShow('cl-token', false)">👁</span>
-        </div>
-      </div>
-      <div class="form-row" style="grid-column: span 2;"><label class="switch" style="font-size:13px;"><input type="checkbox" id="cl-autosync" ${c.autosync ? "checked" : ""}><span class="track"></span> Synchronisation automatique (récupérer à la connexion, envoyer après chaque modification)</label></div>
+    <h2>Synchronisation & sauvegardes</h2>
+    <p class="muted" style="font-size:12px;">
+      Les données sont hébergées de façon centralisée et sécurisée. Chaque utilisateur se connecte simplement
+      avec son <strong>identifiant et son mot de passe</strong>, depuis n'importe quel ordinateur : il n'y a
+      aucun réglage ni aucune clé à saisir. Les mots de passe sont vérifiés côté serveur, et l'accès aux
+      données n'est jamais exposé dans le navigateur.
+    </p>
+    <div class="grid cols-2" style="margin-top:10px;">
+      <div><p class="kpi-label">Sauvegarde à chaque connexion</p><p class="kpi-sub">Une copie datée est déposée sur Google Drive dès qu'un utilisateur se connecte.</p></div>
+      <div><p class="kpi-label">Sauvegarde à chaque enregistrement</p><p class="kpi-sub">Chaque modification crée une version conservée (historique complet, restaurable) + une copie Drive.</p></div>
     </div>
-    <h3 style="font-size:14px; margin:14px 0 6px;">Archivage Google Drive (facultatif)</h3>
-    <div class="form-grid">
-      <div class="form-row" style="grid-column: span 2;"><label>URL du Web App Google Apps Script</label><input id="cl-drive" value="${escapeHtml(c.driveUrl || "")}" placeholder="https://script.google.com/macros/s/…/exec"></div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:12px;">
+      <button class="btn ghost" onclick="cloudPull(false)">⬇ Récupérer maintenant</button>
+      <button class="btn ghost" onclick="cloudPush(false)">⬆ Envoyer maintenant</button>
     </div>
-    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;">
-      <button class="btn accent" onclick="saveCloudConfig()">Enregistrer la configuration</button>
-      <button class="btn ghost" onclick="cloudPull(false)">⬇ Récupérer depuis GitHub</button>
-      <button class="btn ghost" onclick="cloudPush(false)">⬆ Envoyer vers GitHub</button>
-      <button class="btn ghost" onclick="driveBackup(false)">💾 Sauvegarder sur Google Drive</button>
-    </div>
-    <p id="cloud-status" class="muted" style="font-size:12px; margin-top:8px;">${cloudConfigured() ? "Configuré." + (c.autosync ? " Synchronisation automatique activée." : "") : "Non configuré."}</p>
-    <p class="muted" style="font-size:11px; margin-top:6px;">⚠ Le jeton est stocké uniquement sur ce poste (localStorage). Utilisez un jeton « fine-grained » limité à ce seul dépôt. Chaque poste doit être configuré une fois.</p>
+    <p id="cloud-status" class="muted" style="font-size:12px; margin-top:8px;">${escapeHtml(etat)}</p>
   </div>`;
 }
 
